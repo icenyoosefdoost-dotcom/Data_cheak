@@ -1,3 +1,7 @@
 streamlit
 pandas
+streamlit
+pandas
+openpyxl
+python-docx
 openpyxl
