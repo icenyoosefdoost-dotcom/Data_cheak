@@ -7,38 +7,34 @@ from collections import Counter, defaultdict
 from datetime import datetime
 import io
 
-# ==== Optional dependency for Word reports ====
+# ==== Word report dependency ====
 try:
     from docx import Document
-except Exception as e:
+except Exception:
     st.error(
-        "The package 'python-docx' is required to generate the Word report. "
-        "Please add 'python-docx' to your requirements.txt."
+        "The 'python-docx' package is required to generate the Word report.\n"
+        "Please add `python-docx` to your requirements.txt and install dependencies."
     )
-    st.stop()
+    raise
 
 # ---------------------------
 # Streamlit Page config
 # ---------------------------
 st.set_page_config(page_title="Data Cleaning & Validation App", page_icon="🧹", layout="wide")
-st.title("🧹 Data Cleaning & Validation — End-to-End Pipeline")
+st.title("🧹 Data Cleaning & Validation — Pipeline (Excel + Word report)")
 
 st.markdown("""
-This app runs your full **pipeline** in sequence:
-
-1. Column name mapping / standardization  
-2. Two-row header transposition + swap of the first two columns  
-3. Validation (numeric / text / missing / range checks)  
-4. Final **Excel** with validation columns per parameter  
-5. A comprehensive **Word** Validation Report  
+This app runs a complete **pipeline**:
+- Input (Excel/CSV) → Column name mapping/standardization → Transpose & swap the first two header rows →  
+Validation (detect numeric/text/range) → **Final Excel** + **Word report**.
 """)
 
 # ---------------------------
-# Helpers & Reference Data
+# Helpers
 # ---------------------------
 def normalize(name: str) -> str:
-    """Lowercase and strip non-alphanumeric characters."""
-    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+    """Lowercase and remove non-alphanumerics for fuzzy matching."""
+    return re.sub(r'[^a-z0-9]', '', str(name).lower())
 
 standard_names = [
     "Dissolved Oxygen (DO)", "pH", "Water Temperature", "Water Transparency",
@@ -56,7 +52,7 @@ standard_names = [
 ]
 standard_map = {normalize(name): name for name in standard_names}
 
-# Parameter rules used during validation
+# Basic validation rules (extend as needed)
 param_dict = {
     "dissolved oxygen": {"unit": "mg/l", "min": 0, "max": 20},
     "ph": {"unit": "unitless", "min": 0, "max": 14},
@@ -74,12 +70,12 @@ param_dict = {
 }
 
 def is_number_like(x) -> bool:
-    """Return True if x is numeric or can be parsed as float (excluding special markers)."""
+    """Return True if value is safely castable to float (excluding checkmarks and blanks)."""
     try:
         if pd.isna(x):
             return False
         s = str(x).strip()
-        if s in {"✔", "✖", "", "-"}:
+        if s in {'✔', '✖', '', '-'}:
             return False
         float(s)
         return True
@@ -87,19 +83,15 @@ def is_number_like(x) -> bool:
         return False
 
 # ---------------------------
-# Core Pipeline
+# Core pipeline
 # ---------------------------
-def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.BytesIO]:
+def run_pipeline_return_buffers(xl_raw_dict):
     """
-    Args:
-        xl_raw_dict: dict of {sheet_name: DataFrame}
-
-    Returns:
-        excel_buf: BytesIO of the final Excel (all sheets + Column_Mapping)
-        report_buf: BytesIO of the Word Validation Report
+    Input: dict of sheets (sheet_name -> DataFrame)
+    Output: bytes for Final Excel + bytes for Word Report
     """
 
-    # ---- STEP 1: Column name mapping / standardization ----
+    # ---------- Step 1: Column name mapping ----------
     final_data = {}
     mapping_log = []
 
@@ -110,10 +102,10 @@ def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.Bytes
             norm_col = normalize(col)
             best_match, best_score = None, 0.0
 
-            # Hard rules for common typos
-            if "phosphate" in orig_col_lower:
+            # A couple of specific normalization rules
+            if 'phosphate' in orig_col_lower:
                 best_match, best_score = "Orthophosphate (O-P)", 1.0
-            elif "turbitidy" in orig_col_lower:  # common typo
+            elif 'turbitidy' in orig_col_lower:  # common misspelling
                 best_match, best_score = "Turbidity", 1.0
             else:
                 for norm_std, std_name in standard_map.items():
@@ -124,34 +116,39 @@ def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.Bytes
 
             if best_match:
                 new_columns.append(best_match)
-                mapping_log.append(
-                    {"Sheet": sheet_name, "Original Column": col,
-                     "Mapped To": best_match, "Score": round(best_score, 2)}
-                )
+                mapping_log.append({
+                    "Sheet": sheet_name,
+                    "Original Column": col,
+                    "Mapped To": best_match,
+                    "Score": round(best_score, 2)
+                })
             else:
                 new_columns.append(col)
-                mapping_log.append(
-                    {"Sheet": sheet_name, "Original Column": col,
-                     "Mapped To": "(no match)", "Score": 0}
-                )
+                mapping_log.append({
+                    "Sheet": sheet_name,
+                    "Original Column": col,
+                    "Mapped To": "(no match)",
+                    "Score": 0
+                })
 
         data_df = df.copy()
         data_df.columns = range(data_df.shape[1])
-        header_df = pd.DataFrame([new_columns, list(df.columns)])  # Row1=Mapped, Row2=Original
+        # Row 0 = mapped names, Row 1 = original names
+        header_df = pd.DataFrame([new_columns, list(df.columns)])
         full_df = pd.concat([header_df, data_df], ignore_index=True)
         final_data[sheet_name] = full_df
 
-    # ---- STEP 2: Transpose first two rows & swap first two columns ----
+    # ---------- Step 2: Transpose first two rows & swap the first two columns ----------
     step2_sheets = {}
     for sheet_name, df in final_data.items():
-        first_two_rows = df.iloc[:2].T  # transpose
+        first_two_rows = df.iloc[:2].T  # transpose the first two header rows
         cols = list(first_two_rows.columns)
         if len(cols) >= 2:
-            cols[0], cols[1] = cols[1], cols[0]
+            cols[0], cols[1] = cols[1], cols[0]  # swap col0 and col1
             first_two_rows = first_two_rows[cols]
         step2_sheets[sheet_name] = first_two_rows
 
-    # Build mapping dict from step 2
+    # Build a mapping dictionary (original -> mapped) from Step 2
     mapping_all = {}
     for sheet_name, mdf in step2_sheets.items():
         if mdf.shape[1] >= 2:
@@ -161,15 +158,16 @@ def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.Bytes
                 if orig and mapped and orig.lower() != "(no match)":
                     mapping_all[orig.lower()] = mapped.lower()
 
-    # ---- STEP 3/4: Validation (numeric/text/missing/range) ----
+    # ---------- Step 3/4: Validation (numeric/text/range) ----------
     validated_sheets_raw = {}
     for sheet_name, df in xl_raw_dict.items():
         df2 = df.copy()
         df2.columns = [str(c).lower() for c in df2.columns]
 
+        # Convert boolean-like strings to checkmarks for clarity
         df2 = df2.applymap(
-            lambda x: "✔" if str(x).strip().lower() == "true"
-            else "✖" if str(x).strip().lower() == "false"
+            lambda x: '✔' if str(x).strip().lower() == 'true'
+            else '✖' if str(x).strip().lower() == 'false'
             else x
         )
 
@@ -182,14 +180,15 @@ def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.Bytes
 
                 validation_results = []
                 if not any_numeric:
+                    # Entire column looks non-numeric → treat as text/missing
                     for v in series:
-                        if pd.isna(v) or str(v).strip() == "":
+                        if pd.isna(v) or str(v).strip() == '':
                             validation_results.append("Missing")
                         else:
                             validation_results.append("Text")
                 else:
                     for v in series:
-                        if pd.isna(v) or str(v).strip() == "":
+                        if pd.isna(v) or str(v).strip() == '':
                             validation_results.append("Missing")
                         elif is_number_like(v):
                             val_num = float(str(v).strip())
@@ -205,56 +204,232 @@ def run_pipeline_return_buffers(xl_raw_dict: dict) -> tuple[io.BytesIO, io.Bytes
 
         validated_sheets_raw[sheet_name] = df2
 
-    # ---- STEP 5: Word Validation Report ----
+    # ---------- Step 5: Build Word Report (across all sheets) ----------
     doc = Document()
     doc.add_heading("Validation Report", level=0)
     doc.add_paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # (Counters and summaries go here... same as earlier version)
-    # For brevity I skip repeating entire per-sheet and overall summary logic here,
-    # but it is identical to what I gave you before.
+    # Global counters
+    grand_total_records = 0
+    grand_validation_cols = set()
+    grand_total_checks = 0
+    grand_issues = 0
+
+    grand_per_issue_type_counter = Counter()
+    grand_per_param_counter = Counter()
+
+    grand_per_site_issue_counter = defaultdict(Counter)
+    grand_per_site_param_counter = defaultdict(Counter)
+    grand_per_site_valid_counts = Counter()
+    grand_per_site_total_counts = Counter()
+
+    def normalize_issue(val):
+        """Map raw validation text into issue categories for reporting."""
+        s = str(val).strip()
+        # Count "Text" as valid per your previous logic
+        if s in ("Valid", "Text"):
+            return None
+        if s in ("✔", "✖"):
+            return None
+        if s == "" or s.lower() == "nan" or s == "None":
+            return "Missing"
+        if s.startswith("Invalid"):
+            return "Out of Range"
+        if s == "Missing":
+            return "Missing"
+        return "Other"
+
+    for sheet_name, validated_df in validated_sheets_raw.items():
+        # Helpers to pick columns by substring (case-insensitive)
+        def pick(col_part):
+            cols = [c for c in validated_df.columns if col_part in str(c).lower()]
+            return cols[0] if cols else None
+
+        site_name_col = pick("site name")
+        site_id_col   = pick("site id")
+        date_col      = pick("sample date")
+
+        validation_cols = [c for c in validated_df.columns if str(c).startswith("Validation - ")]
+        total_records   = len(validated_df)
+        total_checks    = total_records * len(validation_cols)
+
+        grand_total_records += total_records
+        grand_validation_cols.update(validation_cols)
+        grand_total_checks += total_checks
+
+        issues = []
+        per_param_counter = Counter()
+        per_issue_type_counter = Counter()
+        per_site_issue_counter = defaultdict(Counter)
+        per_site_param_counter = defaultdict(Counter)
+        per_site_valid_counts = Counter()
+        per_site_total_counts = Counter()
+
+        for _, row in validated_df.iterrows():
+            site_id   = row[site_id_col] if site_id_col else ""
+            site_name = row[site_name_col] if site_name_col else ""
+            sample_dt = row[date_col] if date_col else ""
+
+            site_key = (str(site_id), str(site_name))
+
+            for col in validation_cols:
+                param_name = col.replace("Validation - ", "")
+                result = row[col]
+
+                per_site_total_counts[site_key] += 1
+                if str(result).strip() in ("Valid", "Text"):
+                    per_site_valid_counts[site_key] += 1
+
+                issue_type = normalize_issue(result)
+                if issue_type:
+                    issues.append((str(site_id), str(site_name), sample_dt, param_name, issue_type))
+                    per_param_counter[param_name] += 1
+                    per_issue_type_counter[issue_type] += 1
+                    per_site_issue_counter[site_key][issue_type] += 1
+                    per_site_param_counter[site_key][param_name] += 1
+
+        total_issues = len(issues)
+        grand_issues += total_issues
+        grand_per_issue_type_counter.update(per_issue_type_counter)
+        grand_per_param_counter.update(per_param_counter)
+
+        for sk, cnt in per_site_valid_counts.items():
+            grand_per_site_valid_counts[sk] += cnt
+        for sk, cnt in per_site_total_counts.items():
+            grand_per_site_total_counts[sk] += cnt
+        for sk, c in per_site_issue_counter.items():
+            grand_per_site_issue_counter[sk].update(c)
+        for sk, c in per_site_param_counter.items():
+            grand_per_site_param_counter[sk].update(c)
+
+        # Per-sheet summary
+        doc.add_heading(f"[Sheet: {sheet_name}] Summary", level=1)
+        doc.add_paragraph(f"- Total records reviewed: {total_records:,}")
+        doc.add_paragraph(f"- Parameters validated: {len(validation_cols):,}")
+        doc.add_paragraph(f"- Total checks (rows × parameters): {total_checks:,}")
+        doc.add_paragraph(f"- Total issues detected: {total_issues:,}")
+
+        if per_issue_type_counter:
+            doc.add_paragraph("Issues by type:")
+            for itype, cnt in per_issue_type_counter.most_common():
+                doc.add_paragraph(f"   • {itype}: {cnt:,}")
+        else:
+            doc.add_paragraph("No issues detected across all checks.")
+
+        doc.add_heading("Issues by Parameter", level=2)
+        if per_param_counter:
+            for param, cnt in per_param_counter.most_common():
+                doc.add_paragraph(f"• {param}: {cnt:,} issue(s)")
+        else:
+            doc.add_paragraph("No parameter-level issues detected.")
+
+    # Overall summary (all sheets)
+    doc.add_heading("Overall Summary (All Sheets)", level=1)
+    doc.add_paragraph(f"- Total records reviewed: {grand_total_records:,}")
+    doc.add_paragraph(f"- Parameters validated: {len(grand_validation_cols):,}")
+    doc.add_paragraph(f"- Total checks (rows × parameters): {grand_total_checks:,}")
+    doc.add_paragraph(f"- Total issues detected: {grand_issues:,}")
+
+    if grand_per_issue_type_counter:
+        doc.add_paragraph("Issues by type:")
+        for itype, cnt in grand_per_issue_type_counter.most_common():
+            doc.add_paragraph(f"   • {itype}: {cnt:,}")
+    else:
+        doc.add_paragraph("No issues detected across all checks.")
+
+    doc.add_heading("Issues by Parameter (All Sheets)", level=1)
+    if grand_per_param_counter:
+        for param, cnt in grand_per_param_counter.most_common():
+            doc.add_paragraph(f"• {param}: {cnt:,} issue(s)")
+    else:
+        doc.add_paragraph("No parameter-level issues detected.")
+
+    # Station-by-station
+    doc.add_heading("Station-by-Station Summary (All Sheets)", level=1)
+    all_site_keys = set(grand_per_site_total_counts.keys()) | set(grand_per_site_issue_counter.keys())
+
+    def station_sort_key(item):
+        site_key, issue_cnt = item
+        total_issue = sum(issue_cnt.values())
+        # Sort by descending total issues, then by station name, then by ID
+        return (-total_issue, site_key[1], site_key[0])
+
+    for (sid, sname), issue_cnt in sorted(
+        ((sk, grand_per_site_issue_counter.get(sk, Counter())) for sk in all_site_keys),
+        key=station_sort_key
+    ):
+        total_c = grand_per_site_total_counts.get((sid, sname), 0) or 1
+        valid_c = grand_per_site_valid_counts.get((sid, sname), 0)
+        overall_validity = 100.0 * valid_c / total_c
+
+        doc.add_paragraph(f"■ Station '{sname}' (ID: {sid})")
+        doc.add_paragraph(f"  - Total issues: {sum(issue_cnt.values()):,} | Overall Validity: {overall_validity:.1f}%")
+
+        if issue_cnt:
+            doc.add_paragraph("  - Issues by type:")
+            for itype, cnt in issue_cnt.most_common():
+                doc.add_paragraph(f"     • {itype}: {cnt:,}")
+
+        top_params_site = grand_per_site_param_counter.get((sid, sname), Counter())
+        if top_params_site:
+            doc.add_paragraph("  - Most frequent problematic parameters:")
+            for p, c in top_params_site.most_common():
+                doc.add_paragraph(f"     • {p}: {c:,} issue(s)")
+
+    # (Optional) Row-level details can be added here if needed.
 
     # Save Word to bytes
     report_buf = io.BytesIO()
     doc.save(report_buf)
     report_buf.seek(0)
 
-    # Build final Excel
+    # Build final Excel from validated_sheets_raw (no styling for cloud compatibility)
     excel_buf = io.BytesIO()
     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        # Add a mapping summary sheet
         pd.DataFrame(mapping_log).to_excel(writer, index=False, sheet_name="Column_Mapping")
+        # Add each validated sheet
         for sheet_name, vdf in validated_sheets_raw.items():
             vdf.to_excel(writer, sheet_name=sheet_name, index=False)
-    excel_buf.seek(0)
 
+    excel_buf.seek(0)
     return excel_buf, report_buf
 
 # ---------------------------
-# UI
+# UI: Upload & Run
 # ---------------------------
-uploaded = st.file_uploader("Upload a CSV or Excel file", type=["csv", "xlsx"])
+uploaded = st.file_uploader("📤 Choose a CSV or Excel file", type=["csv", "xlsx"])
 run_clicked = st.button("▶️ Run Pipeline")
 
 if uploaded and run_clicked:
     try:
+        # Read input
         if uploaded.name.lower().endswith(".csv"):
             df = pd.read_csv(uploaded)
             xl_raw_dict = {"Sheet1": df}
         else:
+            # Multi-sheet Excel
             xl_raw_dict = pd.read_excel(uploaded, sheet_name=None)
 
         with st.spinner("Running pipeline..."):
             excel_buf, report_buf = run_pipeline_return_buffers(xl_raw_dict)
 
-        st.success("Done! Download your outputs below.")
-        st.download_button("💾 Download Final Excel", data=excel_buf,
-                           file_name="validated_output.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.download_button("📝 Download Validation Report (Word)", data=report_buf,
-                           file_name="Validation_Report.docx",
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        st.success("✅ Processing completed! You can download the outputs below.")
+        st.download_button(
+            "💾 Download Final Excel",
+            data=excel_buf,
+            file_name="validated_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        st.download_button(
+            "📝 Download Word Report",
+            data=report_buf,
+            file_name="Validation_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
 
     except Exception as e:
-        st.error(f"Processing error: {e}")
+        st.error(f"❌ Processing error: {e}")
+
 elif not uploaded:
-    st.info("Please upload a **CSV** or **Excel** file, then click **Run Pipeline**.")
+    st.info("To get started, upload a **CSV** or **Excel** file, then click **Run Pipeline**.")
